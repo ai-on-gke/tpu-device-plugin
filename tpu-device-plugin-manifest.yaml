@@ -1,0 +1,322 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Reference DaemonSet manifest for the TPU device plugin.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: tpu-device-plugin
+  namespace: kube-system
+  labels:
+    k8s-app: tpu-device-plugin
+    addonmanager.kubernetes.io/mode: Reconcile
+spec:
+  selector:
+    matchLabels:
+      k8s-app: tpu-device-plugin
+  template:
+    metadata:
+      labels:
+        k8s-app: tpu-device-plugin
+      annotations:
+        seccomp.security.alpha.kubernetes.io/pod: "runtime/default"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "2112"
+    spec:
+      hostNetwork: true
+      serviceAccountName: tpu-device-plugin-sa
+      priorityClassName: system-node-critical
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: cloud.google.com/gke-tpu-accelerator
+                operator: Exists
+              - key: cloud.google.com/gke-tpu-dra-driver
+                operator: DoesNotExist
+      tolerations:
+      - operator: "Exists"
+        effect: "NoExecute"
+      - operator: "Exists"
+        effect: "NoSchedule"
+      initContainers:
+      - name: token-broker-adc-init
+        image: "gcr.io/gke-release/node_token_broker/init:<TAG>"
+        command:
+        - /node_token_broker_init
+        - --audience=""
+        - --token_url=""
+        - --token_file=""
+        - --output_path=""
+        - --project_id=""
+        volumeMounts:
+        - mountPath: ""
+          name: token-broker-adc
+          readOnly: false
+      - name: "tpu-network-optimization"
+        image: "gcr.io/gke-release/tpu_network_optimizer:<TAG>"
+        securityContext:
+          privileged: true
+        command:
+        - /tpu_network_optimizer.sh
+        volumeMounts:
+        - name: sys
+          mountPath: /sys
+        - name: proc
+          mountPath: /proc
+      volumes:
+      - name: token-broker-ksa
+        projected:
+          sources:
+          - serviceAccountToken:
+              path: ""
+              expirationSeconds: 3600
+              audience: ""
+      - name: token-broker-adc
+        emptyDir: {}
+      - name: device-plugin
+        hostPath:
+          path: /var/lib/kubelet/device-plugins
+          type: DirectoryOrCreate
+      - name: dev
+        hostPath:
+          path: /dev
+          type: DirectoryOrCreate
+      - name: pod-resources
+        hostPath:
+          path: /var/lib/kubelet/pod-resources
+          type: DirectoryOrCreate
+      - name: tpu-env
+        hostPath:
+          path: /etc/tpu
+          type: DirectoryOrCreate
+      - name: tpu-logs
+        hostPath:
+          path: /tmp/tpu_logs
+          type: DirectoryOrCreate
+      - name: sys
+        hostPath:
+          path: /sys
+          type: Directory
+      - name: proc
+        hostPath:
+          path: /proc
+          type: Directory
+      - name: tpu-plugin-run
+        hostPath:
+          path: /var/run/tpu-plugin
+          type: DirectoryOrCreate
+      containers:
+      - image: "gcr.io/gke-release/tpu-device-plugin:<TAG>"
+        name: tpu-device-plugin
+        env:
+        - name: TOKEN_SOURCE_MODE
+          value: ""
+        - name: GKE_NODE_SYSTEM_WORKLOAD_CREDENTIALS
+          value: ""
+        - name: GKE_HOSTNAME
+          value: ""
+        - name: CLUSTER_PROJECT
+          value: ""
+        - name: CLUSTER_LOCATION
+          value: ""
+        - name: CLUSTER_NAME
+          value: ""
+        - name: CONTAINER_NAME
+          value: "tpu-device-plugin"
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: NODE_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        - name: CLOUD_MONITORING_ENDPOINT
+          value: ""
+        resources:
+          requests:
+            cpu: 80m
+            memory: 80Mi
+          limits:
+            memory: 80Mi
+        securityContext:
+          privileged: true
+          runAsUser: 0
+          readOnlyRootFilesystem: true
+          seccompProfile:
+            type: RuntimeDefault
+        volumeMounts:
+        - name: token-broker-ksa
+          mountPath: ""
+          readOnly: true
+        - name: token-broker-adc
+          mountPath: ""
+          readOnly: true
+        - name: tpu-plugin-run
+          mountPath: /var/run/tpu-plugin
+        - name: device-plugin
+          mountPath: /device-plugin
+        - name: dev
+          mountPath: /dev
+        - name: pod-resources
+          mountPath: /var/lib/kubelet/pod-resources
+        - name: tpu-logs
+          mountPath: /tmp/tpu_logs
+        command: ["/usr/bin/tpu-device-plugin"]
+        args: ['--logtostderr', '--enable-alloc-wait', '--enable-flock-wait', "--enable-vbar-uds"]
+      - image: "gcr.io/gke-release/gke-distroless/bash:<TAG>"
+        name: sidecar-log-collector
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+          seccompProfile:
+            type: RuntimeDefault
+        resources:
+          requests:
+            cpu: 20m
+            memory: 20Mi
+          limits:
+            memory: 20Mi
+        args:
+          - /bin/bash
+          - -c
+          - |
+            set -euo pipefail
+            set -m
+            declare -A TAILED_PIDS
+
+            cleanup() {
+              echo 'Shutting down log collector...'
+              for file in "${!TAILED_PIDS[@]}"; do
+                pid="${TAILED_PIDS[$file]}"
+                kill -15 -"$pid" 2>/dev/null || true
+              done
+              exit 0
+            }
+
+            tail_and_prefix() {
+              local file="$1"
+              tail -n+1 -f "$file" | while read -r line; do
+                echo "[$file] $line"
+              done
+            }
+
+            trap cleanup SIGTERM
+
+            shopt -s globstar
+
+            echo "Log collector starting, polling for new files..."
+            while true; do
+              shopt -s nullglob
+              for FILE in /tmp/tpu_logs/**/tpu_driver.INFO; do
+                if [[ ! -v TAILED_PIDS["$FILE"] ]]; then
+                  echo "New log file found, starting tail: $FILE"
+                  tail_and_prefix "$FILE" &
+                  TAILED_PIDS["$FILE"]=$!
+                fi
+              done
+
+              shopt -u nullglob
+
+              for FILE in "${!TAILED_PIDS[@]}"; do
+                if ! kill -0 "${TAILED_PIDS[$FILE]}" 2>/dev/null || [[ ! -e "$FILE" ]]; then
+                  if [[ ! -e "$FILE" ]]; then
+                    echo "Log file '$FILE' removed. Cleaning up tail process ${TAILED_PIDS[$FILE]}."
+                    kill -- -"${TAILED_PIDS[$FILE]}" 2>/dev/null || true
+                  else
+                    echo "Tail process ${TAILED_PIDS[$FILE]} for '$FILE' died. Cleaning up."
+                  fi
+                  unset TAILED_PIDS["$FILE"]
+                fi
+              done
+              sleep 5
+            done
+        volumeMounts:
+        - name: tpu-logs
+          readOnly: true
+          mountPath: /tmp/tpu_logs
+      - image: "gcr.io/gke-release/vbar_control_agent:<TAG>"
+        name: vbar-control-agent
+        env:
+        - name: TPU_SKIP_MDS_QUERY
+          value: 'true'
+        - name: TPU_ON_GKE
+          value: 'true'
+        securityContext:
+          privileged: true
+          readOnlyRootFilesystem: true
+          seccompProfile:
+            type: RuntimeDefault
+        resources:
+          requests:
+            memory: 150Mi
+            cpu: 10m
+          limits:
+            memory: 150Mi
+        volumeMounts:
+        - name: tpu-plugin-run
+          mountPath: /var/run/tpu-plugin
+        command: ["vbar_control_agent_files/bin/vbar_control_agent"]
+        args: ['--logtostderr', '--census_enabled=false', '--gid=', '--uid=', '--chroot=']
+      - image: "gcr.io/gke-release/acs_agent:<TAG>"
+        name: acs-agent
+        env:
+        - name: TPU_ON_GKE
+          value: 'true'
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: NODE_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        securityContext:
+          privileged: false
+          runAsUser: 1000
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+          seccompProfile:
+            type: RuntimeDefault
+        resources:
+          requests:
+            memory: 150Mi
+            cpu: 10m
+          limits:
+            memory: 150Mi
+        command: ["acs_agent_files/bin/acs_agent"]
+  updateStrategy:
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1%
+    type: RollingUpdate
